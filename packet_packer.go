@@ -355,6 +355,12 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 			v,
 		)
 		if initialPayload.length > 0 {
+			// Apply chaos protection to Initial packets
+			remainingSpace := maxSize - size - protocol.ByteCount(initialSealer.Overhead())
+			initialPayload, err = p.applyChaosProtection(initialPayload, remainingSpace, v)
+			if err != nil {
+				return nil, err
+			}
 			size += p.longHeaderPacketLength(initialHdr, initialPayload, v) + protocol.ByteCount(initialSealer.Overhead())
 		}
 	}
@@ -979,4 +985,117 @@ func (p *packetPacker) encryptPacket(raw []byte, sealer sealer, pn protocol.Pack
 
 func (p *packetPacker) SetToken(token []byte) {
 	p.token = token
+}
+
+// applyChaosProtection applies techniques to make QUIC traffic more difficult to fingerprint
+// by splitting CRYPTO frames, adding random PING frames, and randomizing frame order.
+func (p *packetPacker) applyChaosProtection(pl payload, remainingSpace protocol.ByteCount, v protocol.Version) (payload, error) {
+	// Split CRYPTO frames
+	var newFrames []ackhandler.Frame
+	currentLength := protocol.ByteCount(0)
+	for _, f := range pl.frames {
+		if cryptoFrame, ok := f.Frame.(*wire.CryptoFrame); ok {
+			if len(cryptoFrame.Data) <= 1 {
+				newFrames = append(newFrames, f)
+				currentLength += f.Frame.Length(v)
+				continue
+			}
+			// Randomly decide to split into 1 to 10 pieces
+			numPieces := 1 + p.rand.Intn(10)
+			fmt.Printf("numPieces: %d\n", numPieces)
+			remainingData := cryptoFrame.Data
+			fmt.Printf("remainingData length: %d\n", len(remainingData))
+			currentOffset := cryptoFrame.Offset
+			fmt.Printf("currentOffset: %d\n", currentOffset)
+
+			for i := 0; i < numPieces && len(remainingData) > 0; i++ {
+				var splitPoint int
+				if i == numPieces-1 || len(remainingData) == 1 {
+					splitPoint = len(remainingData)
+				} else {
+					splitPoint = 1 + p.rand.Intn(len(remainingData)-1)
+				}
+				fmt.Printf("piece %d, splitPoint: %d\n", i, splitPoint)
+
+				newFrame := &wire.CryptoFrame{
+					Offset: currentOffset,
+					Data:   remainingData[:splitPoint],
+				}
+				fmt.Printf("created frame with offset: %d, data length: %d\n", newFrame.Offset, len(newFrame.Data))
+
+				newFrames = append(newFrames, ackhandler.Frame{Frame: newFrame, Handler: f.Handler})
+				currentLength += newFrame.Length(v)
+				currentOffset += protocol.ByteCount(splitPoint)
+				remainingData = remainingData[splitPoint:]
+				fmt.Printf("remaining data length: %d, current offset: %d\n", len(remainingData), currentOffset)
+			}
+		} else {
+			newFrames = append(newFrames, f)
+			currentLength += f.Frame.Length(v)
+		}
+	}
+
+	// Add PING frames
+	pingFrameLength := (&wire.PingFrame{}).Length(v)
+	maxAddedPingFrames := min(15, int((remainingSpace-currentLength)/pingFrameLength))
+	numPingFrames := p.rand.Intn(maxAddedPingFrames + 1)
+	fmt.Printf("Adding %d PING frames, max allowed: %d\n", numPingFrames, maxAddedPingFrames)
+
+	for i := 0; i < numPingFrames; i++ {
+		if currentLength+pingFrameLength <= remainingSpace {
+			newFrames = append(newFrames, ackhandler.Frame{Frame: &wire.PingFrame{}})
+			currentLength += pingFrameLength
+		} else {
+			break
+		}
+	}
+
+	// Reorder frames
+	fmt.Printf("Reordering %d frames\n", len(newFrames))
+	p.rand.Shuffle(len(newFrames), func(i, j int) {
+		newFrames[i], newFrames[j] = newFrames[j], newFrames[i]
+	})
+
+	// Spread padding
+	var finalFrames []ackhandler.Frame
+	remainingPadding := remainingSpace - currentLength
+	fmt.Printf("Remaining padding: %d bytes\n", remainingPadding)
+
+	for _, f := range newFrames {
+		if remainingPadding > 0 {
+			paddingSize := min(int(remainingPadding), p.rand.Intn(10)+1)
+			if paddingSize > 0 {
+				fmt.Printf("Adding padding frame of %d bytes\n", paddingSize)
+				finalFrames = append(finalFrames, ackhandler.Frame{Frame: &wire.PaddingFrame{PaddingLength: protocol.ByteCount(paddingSize)}})
+				remainingPadding -= protocol.ByteCount(paddingSize)
+				currentLength += protocol.ByteCount(paddingSize)
+			}
+		}
+		finalFrames = append(finalFrames, f)
+	}
+	if remainingPadding > 0 {
+		fmt.Printf("Adding final padding frame of %d bytes\n", remainingPadding)
+		finalFrames = append(finalFrames, ackhandler.Frame{Frame: &wire.PaddingFrame{PaddingLength: remainingPadding}})
+		currentLength += remainingPadding
+	}
+
+	pl.frames = finalFrames
+	pl.length = currentLength
+	fmt.Printf("Total frames after chaos protection: %d, total length: %d bytes\n", len(finalFrames), currentLength)
+
+	// Ensure we haven't exceeded the remaining space
+	if pl.length > remainingSpace {
+		fmt.Printf("ERROR: Exceeded space limit! %d > %d\n", pl.length, remainingSpace)
+		return payload{}, errors.New("chaos protection exceeded remaining space")
+	}
+
+	return pl, nil
+}
+
+// Helper function for applyChaosProtection
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
