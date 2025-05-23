@@ -355,11 +355,13 @@ func (p *packetPacker) PackCoalescedPacket(onlyAck bool, maxSize protocol.ByteCo
 			v,
 		)
 		if initialPayload.length > 0 {
-			// Apply chaos protection to Initial packets
+			// Apply chaos protection to Initial packets, but only for clients
 			remainingSpace := maxSize - size - protocol.ByteCount(initialSealer.Overhead())
-			initialPayload, err = p.applyChaosProtection(initialPayload, remainingSpace, v)
-			if err != nil {
-				return nil, err
+			if p.perspective == protocol.PerspectiveClient {
+				initialPayload, err = p.applyChaosProtection(initialPayload, remainingSpace, v)
+				if err != nil {
+					return nil, err
+				}
 			}
 			size += p.longHeaderPacketLength(initialHdr, initialPayload, v) + protocol.ByteCount(initialSealer.Overhead())
 		}
